@@ -124,6 +124,22 @@ pub struct EngineSyncStateUpdate {
     pub finalized_head: Option<L2BlockInfo>,
 }
 
+/// The execution layer's response to the last forkchoice sent without payload attributes.
+///
+/// The consensus labels in [`EngineSyncState`] can run ahead of the execution layer: a `SYNCING`
+/// response still moves them. Only [`ForkchoiceStatus::Applied`] proves the execution layer holds
+/// a forkchoice, so it is the only status that lets an identical forkchoice update be skipped.
+#[derive(Default, Debug, Copy, Clone, PartialEq, Eq)]
+pub enum ForkchoiceStatus {
+    /// No forkchoice has been answered since startup or the last reset.
+    #[default]
+    Unsent,
+    /// The execution layer answered `VALID` for this forkchoice.
+    Applied(ForkchoiceState),
+    /// The execution layer answered `SYNCING` for this forkchoice and has not applied it yet.
+    Syncing(ForkchoiceState),
+}
+
 /// The chain state viewed by the engine controller.
 #[derive(Default, Debug, Copy, Clone, PartialEq, Eq)]
 pub struct EngineState {
@@ -132,6 +148,9 @@ pub struct EngineState {
 
     /// Whether or not the EL has finished syncing.
     pub el_sync_finished: bool,
+
+    /// The execution layer's response to the last forkchoice update sent to it.
+    pub forkchoice_status: ForkchoiceStatus,
 
     /// Track when the rollup node changes the forkchoice to restore previous
     /// known unsafe chain. e.g. Unsafe Reorg caused by Invalid span batch.
