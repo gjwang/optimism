@@ -167,12 +167,45 @@ fn reset_request() -> (EngineActorRequest, mpsc::Receiver<kona_engine::EngineReq
     (EngineActorRequest::Reset(Box::new(ResetRequest { result_tx })), result_rx)
 }
 
-/// optimism#23757: a delegated sequencer exited with `Finalize(BlockNotSafe)` when an engine
-/// reset restored a safe head below the finalized block the delegate had just reported. The
-/// delegated target must wait across repeated resets without stopping the node, holding the
-/// queue, or triggering another reset, and must finalize once the delegated safe head arrives.
+/// How the finalization target is identified: delegated derivation pins the hash, and
+/// finalization from L1 finality uses the block number.
+#[derive(Clone, Copy, Debug)]
+enum TargetKind {
+    ByHash,
+    ByNumber,
+}
+
+impl TargetKind {
+    fn finalize_request(self, target: L2BlockInfo) -> EngineActorRequest {
+        let block_id = match self {
+            Self::ByHash => FinalizeBlockId::ByHash(target.block_info.id()),
+            Self::ByNumber => FinalizeBlockId::ByNumber(target.block_info.number),
+        };
+        EngineActorRequest::ProcessFinalizedL2Block(Box::new(block_id))
+    }
+
+    fn expect_lookup(self, l2: &RpcMock, target: L2BlockInfo, block: &OpBlock) {
+        let (method, block_id) = match self {
+            Self::ByHash => ("eth_getBlockByHash", serde_json::json!(target.hash())),
+            Self::ByNumber => (
+                "eth_getBlockByNumber",
+                serde_json::json!(format!("{:#x}", target.block_info.number)),
+            ),
+        };
+        l2.expect_params(method, serde_json::json!([block_id, true]), rpc_block(block));
+    }
+}
+
+/// A reset can restore a safe head below a finalization target that was safe when it was
+/// requested. A delegated sequencer exited with `Finalize(BlockNotSafe)` this way
+/// (optimism#23757), and so did a follower whose L1 finalizer target landed after a reset
+/// (optimism#23440). The target must wait across repeated resets without stopping the node,
+/// holding the queue, or triggering another reset, and must finalize once the safe head reaches it.
+#[rstest::rstest]
+#[case::by_hash(TargetKind::ByHash)]
+#[case::by_number(TargetKind::ByNumber)]
 #[tokio::test(start_paused = true)]
-async fn delegated_finalization_survives_resets_below_target() {
+async fn finalization_target_survives_resets_below_it(#[case] target_kind: TargetKind) {
     let genesis_block = RpcBlock::default();
     let mut config = RollupConfig::default();
     config.genesis.l2.hash = genesis_block.header.inner.hash_slow();
@@ -182,15 +215,9 @@ async fn delegated_finalization_survives_resets_below_target() {
         &config.genesis,
     )
     .unwrap();
-    let finalized_block = l2_block(15, B256::with_last_byte(14));
-    let delegated_finalized =
-        L2BlockInfo::from_block_and_genesis(&finalized_block, &config.genesis).unwrap();
-    let delegated_finalize_request = || {
-        EngineActorRequest::ProcessFinalizedL2Block(Box::new(FinalizeBlockId::ByHash(
-            delegated_finalized.block_info.id(),
-        )))
-    };
-    let delegated_safe = test_block_info(20);
+    let target_block = l2_block(15, B256::with_last_byte(14));
+    let target = L2BlockInfo::from_block_and_genesis(&target_block, &config.genesis).unwrap();
+    let restored_safe = test_block_info(20);
     let unsafe_payload = OpExecutionPayloadEnvelope::V1(ExecutionPayloadV1::from_block_slow(
         &l2_block(1, genesis.hash()),
     ));
@@ -214,12 +241,12 @@ async fn delegated_finalization_survives_resets_below_target() {
         Arc::new(NoopBlockSink),
     );
 
-    // Startup reset, with the delegate's finalized target arriving right behind it.
+    // Startup reset, with the finalization target arriving right behind it.
     let (reset, mut first_reset_result) = reset_request();
     requests.send(reset).await.unwrap();
     actor.step().await.unwrap();
     expect_reset_to_genesis(&l1, &l2, &genesis_block);
-    requests.send(delegated_finalize_request()).await.unwrap();
+    requests.send(target_kind.finalize_request(target)).await.unwrap();
     actor.step().await.unwrap();
     assert!(first_reset_result.try_recv().unwrap().is_ok());
     assert_eq!(state_rx.borrow().sync_state.safe_head(), genesis);
@@ -240,31 +267,27 @@ async fn delegated_finalization_survives_resets_below_target() {
     actor.step().await.unwrap();
     assert_eq!(state_rx.borrow().sync_state.unsafe_head(), unsafe_head);
 
-    // A second reset lowers the heads again, and the delegate resubmits the same target.
+    // A second reset lowers the heads again, and the same target is requested again.
     expect_reset_to_genesis(&l1, &l2, &genesis_block);
-    requests.send(delegated_finalize_request()).await.unwrap();
+    requests.send(target_kind.finalize_request(target)).await.unwrap();
     actor.step().await.unwrap();
     assert!(second_reset_result.try_recv().unwrap().is_ok());
-    requests.send(EngineActorRequest::ProcessSafeL2Signal(delegated_safe.into())).await.unwrap();
+    requests.send(EngineActorRequest::ProcessSafeL2Signal(restored_safe.into())).await.unwrap();
     actor.step().await.unwrap();
-    assert_eq!(actor.engine.len(), 1, "only the delegated safe head may remain queued");
+    assert_eq!(actor.engine.len(), 1, "only the safe head update may remain queued");
     assert!(!actor.reset_pending);
     assert_eq!(state_rx.borrow().sync_state.finalized_head(), genesis);
 
-    // Once the delegated safe head is applied, the resubmitted target finalizes.
-    expect_valid_forkchoice(&l2, delegated_safe, delegated_safe, genesis);
-    requests.send(delegated_finalize_request()).await.unwrap();
+    // Once the safe head reaches the target, the repeated request finalizes it.
+    expect_valid_forkchoice(&l2, restored_safe, restored_safe, genesis);
+    requests.send(target_kind.finalize_request(target)).await.unwrap();
     actor.step().await.unwrap();
-    assert_eq!(state_rx.borrow().sync_state.safe_head(), delegated_safe);
-    l2.expect_params(
-        "eth_getBlockByHash",
-        serde_json::json!([delegated_finalized.hash(), true]),
-        rpc_block(&finalized_block),
-    );
-    expect_valid_forkchoice(&l2, delegated_safe, delegated_safe, delegated_finalized);
+    assert_eq!(state_rx.borrow().sync_state.safe_head(), restored_safe);
+    target_kind.expect_lookup(&l2, target, &target_block);
+    expect_valid_forkchoice(&l2, restored_safe, restored_safe, target);
     // With nothing left to do, the actor waits for requests instead of retrying.
     assert!(time::timeout(Duration::from_secs(60), actor.step()).await.is_err());
-    assert_eq!(state_rx.borrow().sync_state.finalized_head(), delegated_finalized);
+    assert_eq!(state_rx.borrow().sync_state.finalized_head(), target);
     assert!(actor.engine.is_empty());
     l1.assert_finished();
     l2.assert_finished();

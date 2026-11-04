@@ -18,7 +18,8 @@ use std::sync::Arc;
 
 type RpcBlock = Block<op_alloy_rpc_types::Transaction>;
 
-const SAFE_HEIGHT: u64 = 10;
+const SAFE: u64 = 10;
+const ABOVE_SAFE: u64 = SAFE + 1;
 
 #[derive(Clone, Copy, Debug)]
 enum Lookup {
@@ -28,7 +29,7 @@ enum Lookup {
 
 /// What the engine returns when the task looks up the target.
 #[derive(Clone, Copy, Debug)]
-enum EngineReply {
+enum Reply {
     Missing,
     NotQueried,
     OtherHash,
@@ -38,10 +39,9 @@ enum EngineReply {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Outcome {
-    BlockIdentityMismatch,
-    BlockNotFound,
-    BlockNotSafe,
     Finalized,
+    Mismatch,
+    NotFound,
     Skipped,
 }
 
@@ -75,7 +75,7 @@ fn block_info(block: &RpcBlock) -> L2BlockInfo {
 fn initial_state() -> EngineState {
     TestEngineStateBuilder::new()
         .with_unsafe_head(test_block_info(20))
-        .with_safe_head(test_block_info(SAFE_HEIGHT))
+        .with_safe_head(test_block_info(SAFE))
         .with_finalized_head(test_block_info(5))
         .build()
 }
@@ -93,12 +93,12 @@ fn block_id(lookup: Lookup, target: L2BlockInfo) -> FinalizeBlockId {
     }
 }
 
-fn reply_block(reply: EngineReply, number: u64) -> Option<RpcBlock> {
+fn reply_block(reply: Reply, number: u64) -> Option<RpcBlock> {
     match reply {
-        EngineReply::Missing | EngineReply::NotQueried => None,
-        EngineReply::OtherHash => Some(l2_block(number, number * 2 + 1)),
-        EngineReply::OtherHeight => Some(target_block(number + 1)),
-        EngineReply::Target => Some(target_block(number)),
+        Reply::Missing | Reply::NotQueried => None,
+        Reply::OtherHash => Some(l2_block(number, number * 2 + 1)),
+        Reply::OtherHeight => Some(target_block(number + 1)),
+        Reply::Target => Some(target_block(number)),
     }
 }
 
@@ -130,45 +130,30 @@ fn outcome_of(result: Result<(), FinalizeTaskError>, finalized_moved: bool) -> O
     };
     assert_eq!(err.severity(), EngineTaskErrorSeverity::Critical, "{err:?}");
     match err {
-        FinalizeTaskError::BlockIdentityMismatch { .. } => Outcome::BlockIdentityMismatch,
-        FinalizeTaskError::BlockNotFound(_) => Outcome::BlockNotFound,
-        FinalizeTaskError::BlockNotSafe => Outcome::BlockNotSafe,
+        FinalizeTaskError::BlockIdentityMismatch { .. } => Outcome::Mismatch,
+        FinalizeTaskError::BlockNotFound(_) => Outcome::NotFound,
         err => panic!("unexpected finalize error: {err:?}"),
     }
 }
 
-/// A pinned target that is not safe yet or not in the engine yet is skipped, so delegated
-/// polling can resubmit it. A pinned lookup never settles for a different block, and by-number
-/// targets keep failing hard because they come from the node's own derivation.
+/// A target above the safe head is skipped, since a reset can lower the safe head below it and a
+/// later request finalizes it or a newer block. A pinned target the engine does not have yet is
+/// skipped too, so delegated polling can resubmit it. A pinned lookup never settles for a
+/// different block, and a by-number target the engine does not have fails hard.
 #[rstest]
-#[case::by_hash_missing(Lookup::ByHash, SAFE_HEIGHT, EngineReply::Missing, Outcome::Skipped)]
-#[case::by_hash_present(Lookup::ByHash, SAFE_HEIGHT, EngineReply::Target, Outcome::Finalized)]
-#[case::by_hash_other_height(
-    Lookup::ByHash,
-    SAFE_HEIGHT,
-    EngineReply::OtherHeight,
-    Outcome::BlockIdentityMismatch
-)]
-#[case::by_hash_other_hash(
-    Lookup::ByHash,
-    SAFE_HEIGHT,
-    EngineReply::OtherHash,
-    Outcome::BlockIdentityMismatch
-)]
-#[case::by_hash_above_safe(Lookup::ByHash, SAFE_HEIGHT + 1, EngineReply::NotQueried, Outcome::Skipped)]
-#[case::by_number_missing(
-    Lookup::ByNumber,
-    SAFE_HEIGHT,
-    EngineReply::Missing,
-    Outcome::BlockNotFound
-)]
-#[case::by_number_present(Lookup::ByNumber, SAFE_HEIGHT, EngineReply::Target, Outcome::Finalized)]
-#[case::by_number_above_safe(Lookup::ByNumber, SAFE_HEIGHT + 1, EngineReply::NotQueried, Outcome::BlockNotSafe)]
+#[case::by_hash_missing(Lookup::ByHash, SAFE, Reply::Missing, Outcome::Skipped)]
+#[case::by_hash_present(Lookup::ByHash, SAFE, Reply::Target, Outcome::Finalized)]
+#[case::by_hash_other_height(Lookup::ByHash, SAFE, Reply::OtherHeight, Outcome::Mismatch)]
+#[case::by_hash_other_hash(Lookup::ByHash, SAFE, Reply::OtherHash, Outcome::Mismatch)]
+#[case::by_hash_above_safe(Lookup::ByHash, ABOVE_SAFE, Reply::NotQueried, Outcome::Skipped)]
+#[case::by_number_missing(Lookup::ByNumber, SAFE, Reply::Missing, Outcome::NotFound)]
+#[case::by_number_present(Lookup::ByNumber, SAFE, Reply::Target, Outcome::Finalized)]
+#[case::by_number_above_safe(Lookup::ByNumber, ABOVE_SAFE, Reply::NotQueried, Outcome::Skipped)]
 #[tokio::test]
 async fn finalize_target(
     #[case] lookup: Lookup,
     #[case] target_number: u64,
-    #[case] reply: EngineReply,
+    #[case] reply: Reply,
     #[case] expected: Outcome,
 ) {
     let cfg = Arc::new(RollupConfig::default());
@@ -177,7 +162,7 @@ async fn finalize_target(
     let block_id = block_id(lookup, target);
     let initial = initial_state();
     let mut state = initial;
-    if !matches!(reply, EngineReply::NotQueried) {
+    if !matches!(reply, Reply::NotQueried) {
         expect_lookup(&l2, block_id, reply_block(reply, target_number));
     }
     if expected == Outcome::Finalized {
@@ -201,7 +186,7 @@ async fn finalize_target(
 async fn missing_pinned_target_finalizes_once_engine_has_it() {
     let cfg = Arc::new(RollupConfig::default());
     let (client, l1, l2) = test_engine_client(cfg.clone());
-    let target = block_info(&target_block(SAFE_HEIGHT));
+    let target = block_info(&target_block(SAFE));
     let block_id = FinalizeBlockId::ByHash(target.block_info.id());
     let task = FinalizeTask::new(Arc::new(client), cfg, block_id);
     let initial = initial_state();
@@ -212,7 +197,7 @@ async fn missing_pinned_target_finalizes_once_engine_has_it() {
     assert_eq!(state, initial);
     l2.assert_finished();
 
-    expect_lookup(&l2, block_id, Some(target_block(SAFE_HEIGHT)));
+    expect_lookup(&l2, block_id, Some(target_block(SAFE)));
     expect_finalizing_forkchoice(&l2, &state, target);
     task.execute(&mut state).await.unwrap();
     assert_eq!(state, with_finalized(initial, target));

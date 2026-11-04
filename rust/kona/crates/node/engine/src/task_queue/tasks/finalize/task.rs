@@ -34,18 +34,16 @@ impl ExecutableEngineTask for FinalizeTask {
 
         // Sanity check that the block that is being finalized is at least safe.
         if state.sync_state.safe_head().block_info.number < block_number {
-            // A pinned target comes from an upstream, which can run ahead of the local safe head.
-            // Like op-node, skip it rather than stop the node; the upstream resubmits it.
-            if let FinalizeBlockId::ByHash(target) = self.block_id {
-                warn!(
-                    target: "engine",
-                    ?target,
-                    safe_number = state.sync_state.safe_head().block_info.number,
-                    "Skipping finalization target above the safe head"
-                );
-                return Ok(());
-            }
-            return Err(FinalizeTaskError::BlockNotSafe);
+            // A reset can lower the safe head below a target that was safe when it was requested,
+            // and a delegate can run ahead of the local safe head. Like op-node, skip the target
+            // rather than stop the node; a later request finalizes it or a newer block.
+            warn!(
+                target: "engine",
+                block_id = ?self.block_id,
+                safe_number = state.sync_state.safe_head().block_info.number,
+                "Skipping finalization target above the safe head"
+            );
+            return Ok(());
         }
 
         // Look up by hash when the caller pinned a specific hash (delegated polling supplies
