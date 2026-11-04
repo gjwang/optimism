@@ -3,6 +3,7 @@
 use crate::{
     EngineTaskError, SynchronizeTaskError, task_queue::tasks::task::EngineTaskErrorSeverity,
 };
+use alloy_eips::BlockNumHash;
 use alloy_transport::{RpcError, TransportErrorKind};
 use kona_protocol::FromBlockError;
 use thiserror::Error;
@@ -16,6 +17,14 @@ pub enum FinalizeTaskError {
     /// The block to finalize was not found.
     #[error("The block to finalize was not found: Number {0}")]
     BlockNotFound(u64),
+    /// The engine returned a block whose hash or number differs from the pinned target.
+    #[error("The engine returned block {actual:?} for the pinned finalization target {expected:?}")]
+    BlockIdentityMismatch {
+        /// The hash and number of the block the engine returned.
+        actual: BlockNumHash,
+        /// The hash and number the caller pinned.
+        expected: BlockNumHash,
+    },
     /// An error occurred while transforming the RPC block into [`L2BlockInfo`].
     ///
     /// [`L2BlockInfo`]: kona_protocol::L2BlockInfo
@@ -32,9 +41,10 @@ pub enum FinalizeTaskError {
 impl EngineTaskError for FinalizeTaskError {
     fn severity(&self) -> EngineTaskErrorSeverity {
         match self {
-            Self::BlockNotSafe | Self::BlockNotFound(_) | Self::FromBlock(_) => {
-                EngineTaskErrorSeverity::Critical
-            }
+            Self::BlockIdentityMismatch { .. } |
+            Self::BlockNotFound(_) |
+            Self::BlockNotSafe |
+            Self::FromBlock(_) => EngineTaskErrorSeverity::Critical,
             Self::TransportError(_) => EngineTaskErrorSeverity::Temporary,
             Self::ForkchoiceUpdateFailed(inner) => inner.severity(),
         }
