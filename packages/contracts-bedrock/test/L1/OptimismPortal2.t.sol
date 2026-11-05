@@ -23,6 +23,7 @@ import { Constants } from "src/libraries/Constants.sol";
 import { Predeploys } from "src/libraries/Predeploys.sol";
 import { AddressAliasHelper } from "src/vendor/AddressAliasHelper.sol";
 import { Features } from "src/libraries/Features.sol";
+import { BridgeHookTypes } from "src/libraries/BridgeHookTypes.sol";
 import "src/dispute/lib/Types.sol";
 import { UnknownChainId } from "src/dispute/lib/Errors.sol";
 
@@ -2293,6 +2294,76 @@ contract OptimismPortal2_FinalizeWithdrawalTransaction_Test is OptimismPortal2_T
         assertTrue(optimismPortal2.finalizedWithdrawals(_withdrawalHash));
     }
 
+    /// @notice Tests that `finalizeWithdrawalTransaction` reverts if the AnchorStateRegistry's
+    ///         finality delay is zero, as it is when its proxy is upgraded without calling
+    ///         `initialize`.
+    function test_finalizeWithdrawalTransaction_zeroFinalityDelay_reverts() external {
+        uint256 delay = anchorStateRegistry.disputeGameFinalityDelaySeconds();
+
+        optimismPortal2.proveWithdrawalTransaction({
+            _tx: _defaultTx,
+            _disputeGameIndex: _proposedGameIndex,
+            _outputRootProof: _outputRootProof,
+            _withdrawalProof: _withdrawalProof
+        });
+
+        // Resolve the dispute game.
+        game.resolveClaim(0, 0);
+        game.resolve();
+
+        // Warp past both the proof maturity delay and the finality delay.
+        vm.warp(block.timestamp + optimismPortal2.proofMaturityDelaySeconds() + delay + 1);
+
+        // Clear the AnchorStateRegistry's finality delay.
+        StorageSlot memory slot = ForgeArtifacts.getSlot("AnchorStateRegistry", "disputeGameFinalityDelaySeconds");
+        vm.store(address(anchorStateRegistry), bytes32(slot.slot), bytes32(0));
+
+        // Attempt to finalize the withdrawal. This should fail.
+        vm.expectRevert(IOptimismPortal.OptimismPortal_InvalidRootClaim.selector);
+        optimismPortal2.finalizeWithdrawalTransaction(_defaultTx);
+
+        // Set the delay again and finalize the withdrawal. This should succeed.
+        vm.prank(anchorStateRegistry.proxyAdminOwner());
+        anchorStateRegistry.setDisputeGameFinalityDelaySeconds(delay);
+        optimismPortal2.finalizeWithdrawalTransaction(_defaultTx);
+        assertTrue(optimismPortal2.finalizedWithdrawals(_withdrawalHash));
+    }
+
+    /// @notice Tests that `finalizeWithdrawalTransaction` reverts if the proof maturity delay is
+    ///         zero, as it is when the portal proxy is upgraded without calling `initialize`.
+    function test_finalizeWithdrawalTransaction_zeroProofMaturityDelay_reverts() external {
+        uint256 delay = optimismPortal2.proofMaturityDelaySeconds();
+
+        optimismPortal2.proveWithdrawalTransaction({
+            _tx: _defaultTx,
+            _disputeGameIndex: _proposedGameIndex,
+            _outputRootProof: _outputRootProof,
+            _withdrawalProof: _withdrawalProof
+        });
+
+        // Resolve the dispute game.
+        game.resolveClaim(0, 0);
+        game.resolve();
+
+        // Warp past both the proof maturity delay and the finality delay.
+        vm.warp(block.timestamp + delay + optimismPortal2.disputeGameFinalityDelaySeconds() + 1);
+
+        // Clear the proof maturity delay.
+        StorageSlot memory slot = ForgeArtifacts.getSlot("OptimismPortal2", "proofMaturityDelaySeconds");
+        vm.store(address(optimismPortal2), bytes32(slot.slot), bytes32(0));
+        assertEq(optimismPortal2.proofMaturityDelaySeconds(), 0);
+
+        // Attempt to finalize the withdrawal. This should fail.
+        vm.expectRevert(IOptimismPortal.OptimismPortal_ProofNotOldEnough.selector);
+        optimismPortal2.finalizeWithdrawalTransaction(_defaultTx);
+
+        // Set the delay again and finalize the withdrawal. This should succeed.
+        vm.prank(optimismPortal2.proxyAdminOwner());
+        optimismPortal2.setProofMaturityDelaySeconds(delay);
+        optimismPortal2.finalizeWithdrawalTransaction(_defaultTx);
+        assertTrue(optimismPortal2.finalizedWithdrawals(_withdrawalHash));
+    }
+
     /// @notice Tests that `finalizeWithdrawalTransaction` reverts if the respected game type was
     ///         updated after the dispute game was created.
     function test_finalizeWithdrawalTransaction_gameOlderThanRespectedGameTypeUpdate_reverts() external {
@@ -3318,5 +3389,59 @@ contract OptimismPortal2_BridgeHook_Test is OptimismPortal2_TestInit {
         vm.expectRevert(IOptimismPortal.OptimismPortal_InvalidBridgeHookState.selector);
         vm.prank(proxyAdminOwner);
         optimismPortal2.removeHook();
+    }
+
+    /// @notice Tests that completeDepositTransaction reverts for a caller that is not the hook,
+    ///         so it cannot take ETH.
+    /// @param _caller The address attempting the call.
+    /// @param _value The ETH sent with the call.
+    function testFuzz_completeDepositTransaction_notBridgeHook_reverts(address _caller, uint256 _value) external {
+        vm.assume(_caller != hook);
+        _value = bound(_value, 0, 1 ether);
+        BridgeHookTypes.Item memory item;
+        vm.deal(_caller, _value);
+
+        vm.expectRevert(IOptimismPortal.OptimismPortal_NotBridgeHook.selector);
+        vm.prank(_caller);
+        optimismPortal2.completeDepositTransaction{ value: _value }(item);
+    }
+
+    /// @notice Tests that completeDepositTransaction reverts for the hook too, because the Portal
+    ///         cannot hold deposits yet.
+    function test_completeDepositTransaction_bridgeHook_reverts() external {
+        forceSetBridgeHook(hook);
+        BridgeHookTypes.Item memory item;
+        vm.deal(hook, 1 ether);
+
+        vm.expectRevert(IOptimismPortal.OptimismPortal_NotBridgeHook.selector);
+        vm.prank(hook);
+        optimismPortal2.completeDepositTransaction{ value: 1 ether }(item);
+    }
+
+    /// @notice Tests that completeWithdrawalTransaction reverts for a caller that is not the
+    ///         hook, so it cannot take ETH.
+    /// @param _caller The address attempting the call.
+    /// @param _value The ETH sent with the call.
+    function testFuzz_completeWithdrawalTransaction_notBridgeHook_reverts(address _caller, uint256 _value) external {
+        vm.assume(_caller != hook);
+        _value = bound(_value, 0, 1 ether);
+        BridgeHookTypes.Item memory item;
+        vm.deal(_caller, _value);
+
+        vm.expectRevert(IOptimismPortal.OptimismPortal_NotBridgeHook.selector);
+        vm.prank(_caller);
+        optimismPortal2.completeWithdrawalTransaction{ value: _value }(item);
+    }
+
+    /// @notice Tests that completeWithdrawalTransaction reverts for the hook too, because the
+    ///         Portal cannot hold withdrawals yet.
+    function test_completeWithdrawalTransaction_bridgeHook_reverts() external {
+        forceSetBridgeHook(hook);
+        BridgeHookTypes.Item memory item;
+        vm.deal(hook, 1 ether);
+
+        vm.expectRevert(IOptimismPortal.OptimismPortal_NotBridgeHook.selector);
+        vm.prank(hook);
+        optimismPortal2.completeWithdrawalTransaction{ value: 1 ether }(item);
     }
 }
