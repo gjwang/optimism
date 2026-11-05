@@ -20,14 +20,10 @@ use jsonrpsee::{
 };
 use reth_chainspec::EthChainSpec;
 use reth_e2e_test_utils::{transaction::TransactionTestContext, wallet::Wallet};
-use reth_evm::ConfigureEvm;
 use reth_optimism_primitives::OpTransactionSigned;
 use reth_provider::{ReceiptProvider, StateProviderFactory};
 use reth_rpc_api::clients::{DebugApiClient, TraceApiClient};
-use reth_rpc_eth_api::{
-    RpcNodeCore,
-    helpers::{Call, LoadBlock, Trace},
-};
+use reth_rpc_eth_api::helpers::{Call, LoadBlock, Trace};
 use revm::inspector::NoOpInspector;
 use serde_json::json;
 use std::time::Duration;
@@ -85,11 +81,13 @@ async fn later_transactions_include_prior_sdm_settlement() -> eyre::Result<()> {
     .await?;
     assert_eq!(block_traces.len(), transactions.len());
     let mut cumulative_gas = 0;
+    let mut settled_gas = Vec::new();
     for (index, transaction) in transactions[..4].iter().enumerate() {
         let hash = transaction.tx_hash();
         let receipt = node.inner.provider.receipt_by_hash(hash)?.unwrap();
         let gas_used = receipt.cumulative_gas_used() - cumulative_gas;
         cumulative_gas = receipt.cumulative_gas_used();
+        settled_gas.push(gas_used);
         let trace =
             DebugApiClient::<TransactionRequest>::debug_trace_transaction(&client, hash, None)
                 .await?;
@@ -142,28 +140,13 @@ async fn later_transactions_include_prior_sdm_settlement() -> eyre::Result<()> {
 
     let eth_api = node.rpc.inner.eth_api().clone();
     let recovered = eth_api.recovered_block(block.hash().into()).await?.unwrap();
-    let recipient = Address::repeat_byte(0x55);
-    let modified = eth_api
+    let replayed = eth_api
         .spawn_with_state_at_block(block.parent_hash(), move |api, mut database| {
-            let mut environment =
-                api.evm_config().tx_env(recovered.transactions_recovered().nth(2).unwrap());
-            environment.base.gas_limit = 21_000;
-            environment.base.data = Bytes::new();
-            environment.base.kind = TxKind::Call(recipient);
-            environment.base.value = U256::from(1);
-            api.inspect_transaction_in_block(
-                &recovered,
-                &mut database,
-                NoOpInspector {},
-                2,
-                environment,
-                None,
-            )
-            .map(|(output, _)| output)
+            api.inspect_transaction_in_block(&recovered, &mut database, NoOpInspector {}, 2, None)
+                .map(|(output, _)| output)
         })
         .await?;
-    assert_eq!(modified.state[&recipient].info.balance, U256::from(1));
-    assert_eq!(modified.result.tx_gas_used(), 21_000);
+    assert_eq!(replayed.result.tx_gas_used(), settled_gas[2]);
 
     let state = node.inner.provider.state_by_block_hash(block.hash())?;
     let sender_balance = state.account_balance(&sender)?.unwrap();

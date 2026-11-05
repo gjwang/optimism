@@ -9,7 +9,6 @@ pub mod transaction;
 mod block;
 mod call;
 mod pending_block;
-mod trace;
 
 use crate::{
     OpEthApiError, SequencerClient,
@@ -41,7 +40,7 @@ use reth_rpc_eth_api::{
     RpcNodeCoreExt, RpcTypes,
     helpers::{
         EthApiSpec, EthFees, EthState, EthSubscriptions, LoadFee, LoadPendingBlock, LoadState,
-        SpawnBlocking, bal::GetBlockAccessList, pending_block::BuildPendingEnv,
+        SpawnBlocking, Trace, bal::GetBlockAccessList, pending_block::BuildPendingEnv,
     },
 };
 use reth_rpc_eth_types::{
@@ -431,6 +430,14 @@ impl<N, Rpc> EthSubscriptions for OpEthApi<N, Rpc>
 where
     N: RpcNodeCore,
     Rpc: RpcConvert<Primitives = N::Primitives, Error = OpEthApiError>,
+{
+}
+
+impl<N, Rpc> Trace for OpEthApi<N, Rpc>
+where
+    N: RpcNodeCore,
+    OpEthApiError: FromEvmError<N::Evm>,
+    Rpc: RpcConvert<Primitives = N::Primitives, Error = OpEthApiError, Evm = N::Evm>,
 {
 }
 
